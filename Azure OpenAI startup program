@@ -1,0 +1,184 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+r"""
+run_prompts_via_proxy_no_verify_gpt5_responses_strict_reasoning.py
+- UNC デスクトップの prompts.csv / .xlsx を読み込み
+- プロキシ経由・SSL検証オフで Azure OpenAI (GPT-5, Responses API, api-version=preview) を呼び出し
+- 結果を prompts_results.xlsx として保存
+- reasoning は指定値を厳格に使用（自動ダウングレード無し）
+- タイムアウトは 240s
+- verbosity は常に low
+"""
+
+import os
+import sys
+import time
+from pathlib import Path
+from typing import List, Dict, Optional
+
+import pandas as pd
+import httpx
+from dotenv import load_dotenv
+from openai import AzureOpenAI
+
+# --- リトライ対象例外（SDK差分を吸収） -------------------------------------
+try:
+    from openai import error as _openai_error  # v0系
+    RETRY_ERRORS = (_openai_error.Timeout, _openai_error.APIError, _openai_error.RateLimitError)
+except Exception:
+    try:
+        from openai import APIError, RateLimitError, APITimeoutError  # v1系
+        RETRY_ERRORS = (APITimeoutError, APIError, RateLimitError)
+    except Exception:
+        RETRY_ERRORS = (Exception,)
+# ---------------------------------------------------------------------------
+
+# ───────────── ユーザ設定 ───────────── #
+DESKTOP_DIR: Path        = Path(r"\\FRedirect\desktop$\mk07637")
+DEFAULT_INPUT_FILE: str  = "prompts.csv"     # .csv / .xlsx 両対応
+OUTPUT_FILE_NAME: str    = "prompts_results.xlsx"
+MAX_RETRIES: int         = 3
+WAIT_SEC: int            = 2
+FALLBACK_TEXT: str       = "I do not know"
+
+# reasoning を固定（フォールバックしない）
+STRICT_REASONING: bool   = True
+REASONING_EFFORT: str    = "high"            # ← ここを "low" / "medium" 等に変更可
+
+# タイムアウトは 60s → 240s（4倍）
+HTTP_TIMEOUT_SEC: float  = 240.0
+# ────────────────────────────────────── #
+
+# 1) .env（4項目だけでOK）
+load_dotenv(override=True)
+api_key     = os.getenv("OPENAI_API_KEY")
+endpoint    = os.getenv("AZURE_OPENAI_ENDPOINT")  # 例: https://<resource>.cognitiveservices.azure.com
+deployment  = os.getenv("OPENAI_DEPLOYMENT_NAME", "gpt-5")
+if not api_key or not endpoint:
+    raise RuntimeError("❌ OPENAI_API_KEY / AZURE_OPENAI_ENDPOINT が未設定です。")
+
+# 2) プロキシ（未設定ならローカル既定）
+os.environ.setdefault("HTTP_PROXY",  os.getenv("HTTP_PROXY",  "http://localhost:3128"))
+os.environ.setdefault("HTTPS_PROXY", os.getenv("HTTPS_PROXY", "http://localhost:3128"))
+
+# 3) httpx クライアント（SSL検証オフ・タイムアウト 240s）
+http_client = httpx.Client(
+    verify=False,             # ← 開発用途のみ
+    timeout=HTTP_TIMEOUT_SEC,
+    trust_env=True,
+)
+
+# 4) Azure OpenAI クライアント（Responses API は /openai/v1/ & api-version=preview）
+client = AzureOpenAI(
+    api_key=api_key,
+    base_url=f"{endpoint}/openai/v1/",
+    api_version="preview",
+    http_client=http_client,
+)
+
+# ───────────────── 関数定義 ───────────────── #
+
+def load_prompts(path: Path) -> List[str]:
+    if not path.exists():
+        raise FileNotFoundError(f"❌ Prompt file not found: {path}")
+    df = pd.read_csv(path) if path.suffix.lower() == ".csv" else pd.read_excel(path)
+    series = df["prompt"] if "prompt" in df.columns else df.iloc[:, 0]
+    return series.astype(str).tolist()
+
+def _extract_text_from_response(resp) -> str:
+    text = getattr(resp, "output_text", None)
+    if text:
+        return text.strip()
+    try:
+        parts = []
+        for item in getattr(resp, "output", []) or []:
+            for c in getattr(item, "content", []) or []:
+                if getattr(c, "type", "") in ("output_text", "text"):
+                    t = getattr(c, "text", "")
+                    if t:
+                        parts.append(t)
+        text = "".join(parts).strip()
+        if text:
+            return text
+    except Exception:
+        pass
+    return ""
+
+def chat_once(prompt: str) -> (str, Optional[str]):
+    """
+    Responses API に 1 回問い合わせて (応答文字列, エラーメッセージ) を返す。
+    reasoning は STRICT に固定。未対応でもフォールバックしない。
+    verbosity は常に low を送信。
+    """
+    instructions = "Answer concisely. Do not include chain-of-thought."
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            kwargs = dict(
+                model=deployment,
+                input=prompt,
+                instructions=instructions,
+                # ▼ 追加：verbosity を低冗長に固定
+                text={"verbosity": "low"},
+            )
+            if STRICT_REASONING:
+                kwargs["reasoning"] = {"effort": REASONING_EFFORT}
+
+            resp = client.responses.create(**kwargs)
+            text = _extract_text_from_response(resp)
+            return (text if text else FALLBACK_TEXT, None)
+
+        except RETRY_ERRORS as exc:
+            msg = str(exc)
+            if "not supported" in msg.lower() or "unknown parameter" in msg.lower():
+                return (FALLBACK_TEXT, f"request failed (reasoning='{REASONING_EFFORT}', verbosity='low'): {msg}")
+            if attempt == MAX_RETRIES:
+                return (FALLBACK_TEXT, f"request failed after retries (reasoning='{REASONING_EFFORT}', verbosity='low'): {msg}")
+            backoff = WAIT_SEC * attempt
+            print(f"[Retry {attempt}/{MAX_RETRIES}] {exc} → wait {backoff}s", file=sys.stderr)
+            time.sleep(backoff)
+
+        except Exception as exc:
+            msg = str(exc)
+            return (FALLBACK_TEXT, f"unexpected error (reasoning='{REASONING_EFFORT}', verbosity='low'): {msg}")
+
+def save_results(results: List[Dict[str, str]], path: Path) -> None:
+    if not results:
+        print("⚠️  保存対象が空のためスキップ", file=sys.stderr)
+        return
+    try:
+        with pd.ExcelWriter(path, engine="xlsxwriter") as w:
+            pd.DataFrame(results).to_excel(w, index=False, sheet_name="results")
+        print(f"✅ Results saved: {path}")
+    except Exception as exc:
+        print(f"❌ Failed to save results: {exc}", file=sys.stderr)
+
+# ─────────────────── メイン ─────────────────── #
+
+def main() -> None:
+    input_path  = DESKTOP_DIR / DEFAULT_INPUT_FILE
+    output_path = DESKTOP_DIR / OUTPUT_FILE_NAME
+
+    print(f"📥 Loading prompts from: {input_path}")
+    prompts = load_prompts(input_path)
+    print(f"✅ {len(prompts)} prompts loaded")
+
+    results: List[Dict[str, str]] = []
+    try:
+        for i, p in enumerate(prompts, 1):
+            print(f"[{i}/{len(prompts)}] querying…")
+            ans, err = chat_once(p)
+            row = {
+                "prompt": p,
+                "response": ans,
+                "reasoning_effort": REASONING_EFFORT if STRICT_REASONING else "",
+                "error": err or "",
+            }
+            results.append(row)
+    finally:
+        print(f"💾 Saving → {output_path}")
+        save_results(results, output_path)
+    print("🎉 All done!")
+
+if __name__ == "__main__":
+    main()
