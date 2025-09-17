@@ -1,0 +1,93 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+generate_ih_mortality_prompts.py
+─────────────────────────────────────────────
+1. /mnt/data/Book1.xlsx
+2. /mnt/data/Book1 - Copy.xlsx
+3. <User Desktop>/Book1.xlsx
+4. <User Desktop>/Book1 - Copy.xlsx
+The script checks these paths in order and reads the first existing Excel file.
+
+Output:
+- If /mnt/data exists, output to /mnt/data/ih_mortality_prompts.csv
+- Otherwise, output to <Desktop>/ih_mortality_prompts.csv
+"""
+
+import csv
+from pathlib import Path
+from textwrap import dedent
+import pandas as pd
+
+# ------------------------------------------------------------
+# 1) Detect input/output paths
+# ------------------------------------------------------------
+desktop = Path.home() / "Desktop"
+if not desktop.exists():
+    desktop = Path.home() / "デスクトップ"
+
+candidates = [
+    Path("/mnt/data/Book1.xlsx"),
+    Path("/mnt/data/Book1 - Copy.xlsx"),
+    desktop / "Book1.xlsx",
+    desktop / "Book1 - Copy.xlsx",
+]
+
+for p in candidates:
+    if p.exists():
+        EXCEL_PATH = p
+        break
+else:
+    raise FileNotFoundError("Book1.xlsx not found.")
+
+OUTPUT_CSV = Path("/mnt/data/ih_mortality_prompts.csv") if Path("/mnt/data").exists() \
+             else desktop / "ih_mortality_prompts.csv"
+
+# ------------------------------------------------------------
+# 2) Prompt template in English
+# ------------------------------------------------------------
+TEMPLATE = dedent("""\
+    ### ⬆ system ⬆
+    You are a stroke specialist.
+    - You must not refer to any patient-specific information other than the "Patient Data" provided below.
+    - You may use general medical knowledge in your reasoning, but in the rationale section, cite only the patient data.
+    - Strictly follow the instructed output format and do not include unnecessary words.
+
+    ### ⬆ user ⬆
+    Based on the following Patient Data, estimate the in-hospital mortality risk (0–100) for a patient admitted with intracerebral hemorrhage (ICH) and provide your rationale.
+
+    (Hereinafter, `ih_mortality` refers to in-hospital mortality from intracerebral hemorrhage.)
+
+    1. Provide a step-by-step reasoning process (maximum 1200 characters) in English.
+    2. Then, output **〈Final JSON〉** containing only the following keys.
+
+    {tabular}
+
+    【JSON Keys】
+    - "ih_mortality_prob"      : integer from 0 to 100
+    - "ih_mortality_rationale" : rationale citing patient data (English)
+    """)
+
+# ------------------------------------------------------------
+# 3) Main process
+# ------------------------------------------------------------
+def main() -> None:
+    print(f"[i] Using file: {EXCEL_PATH}")
+    df = pd.read_excel(EXCEL_PATH, sheet_name=0)
+
+    records = []
+    for idx, row in df.iterrows():
+        patient_block = "\n".join(f"{col}: {row[col]}" for col in df.columns)
+        prompt_text = TEMPLATE.format(tabular=patient_block)
+        records.append({"id": idx + 1, "prompt": prompt_text})
+
+    pd.DataFrame(records).to_csv(
+        OUTPUT_CSV,
+        index=False,
+        encoding="utf-8-sig",
+        quoting=csv.QUOTE_ALL,
+    )
+    print(f"[✔] Output written to {OUTPUT_CSV}")
+
+if __name__ == "__main__":
+    main()
