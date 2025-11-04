@@ -1,27 +1,64 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 r"""
-run_prompts_via_proxy_no_verify_gpt5_responses_strict_reasoning.py
-- UNC デスクトップの prompts.csv / .xlsx を読み込み
-- プロキシ経由・SSL検証オフで Azure OpenAI (GPT-5, Responses API, api-version=preview) を呼び出し
-- 結果を prompts_results.xlsx として保存
-- reasoning は指定値を厳格に使用（自動ダウングレード無し）
-- タイムアウトは 240s
-- verbosity は常に low
+run_prompts_via_proxy_no_verify_gpt5_mm_responses.py
+（/mnt/data/mrs3_prompts.csv 優先取り込み + 画像同梱・サブフォルダ対応 + image_file優先 + XLSX/CSV 保存
+  + GPT-5 Responses API / reasoning 固定 / verbosity=low / タイムアウト 240s / HTTP2自動フォールバック）
+
+- 入力優先順:
+    1) /mnt/data/mrs3_prompts.csv      ← 添付CSVを最優先
+    2) <Desktop>/mrs3_prompts.csv
+    3) <Desktop>/ih_mortality_prompts.csv
+    4) <Desktop>/prompts.xlsx / prompts.csv
+  必須列: id, prompt（idは数字を抽出して7桁化）／任意: image_file（; または , 区切りで複数可）
+  ※ 表形式の患者データは prompt 内に Markdown テーブル等で埋め込んでOK
+
+- 画像ルート候補（最初に見つかったものを使用）:
+    <Desktop>/画像ファイル, <Desktop>/画像データ, /mnt/data/画像ファイル, /mnt/data/画像データ
+
+- 出力: <Desktop>/prompts_results.xlsx と <Desktop>/prompts_results.csv
+
+- 送信: Azure OpenAI (GPT-5, Responses API, api-version=preview) に
+        input=[{"role":"user","content":[{"type":"input_text"}, {"type":"input_image"}, ...]}] で送信
+  ・reasoning は指定値を厳格に使用（自動ダウングレード無し）
+  ・verbosity は常に low
+  ・HTTP タイムアウトは 240s（HTTP/2 は h2 が入っている場合のみ。未インストール時は自動で HTTP/1.1）
 """
 
 import os
 import sys
 import time
+import base64
+import mimetypes
+import csv
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import pandas as pd
 import httpx
 from dotenv import load_dotenv
 from openai import AzureOpenAI
 
-# --- リトライ対象例外（SDK差分を吸収） -------------------------------------
+# ───────────── ユーザ設定 ───────────── #
+DESKTOP_DIR: Path        = Path(r"\\FRedirect\desktop$\mk07637")
+DEFAULT_CSVS: List[str]  = ["mrs3_prompts.csv", "ih_mortality_prompts.csv", "prompts.xlsx", "prompts.csv"]
+OUTPUT_FILE_NAME: str    = "prompts_results.xlsx"
+OUTPUT_CSV_NAME: str     = "prompts_results.csv"
+IMAGES_DIR_CANDIDATES    = ("画像ファイル", "画像データ")
+MAX_RETRIES: int         = 3
+WAIT_SEC: int            = 2
+FALLBACK_TEXT: str       = "I do not know"
+REQUIRE_IMAGE: bool      = True   # 画像必須（見つからなければ送信スキップ）
+
+# reasoning を固定（フォールバックしない）
+STRICT_REASONING: bool   = True
+REASONING_EFFORT: str    = "high"   # "minimal" / "low" / "medium" / "high"
+
+# HTTP タイムアウト
+HTTP_TIMEOUT_SEC: float  = 240.0
+# ──────────────────────────────────── #
+
+# --- リトライ対象例外（SDK差分を吸収） ---
 try:
     from openai import error as _openai_error  # v0系
     RETRY_ERRORS = (_openai_error.Timeout, _openai_error.APIError, _openai_error.RateLimitError)
@@ -31,25 +68,9 @@ except Exception:
         RETRY_ERRORS = (APITimeoutError, APIError, RateLimitError)
     except Exception:
         RETRY_ERRORS = (Exception,)
-# ---------------------------------------------------------------------------
 
-# ───────────── ユーザ設定 ───────────── #
-DESKTOP_DIR: Path        = Path(r"\\FRedirect\desktop$\mk07637")
-DEFAULT_INPUT_FILE: str  = "prompts.csv"     # .csv / .xlsx 両対応
-OUTPUT_FILE_NAME: str    = "prompts_results.xlsx"
-MAX_RETRIES: int         = 3
-WAIT_SEC: int            = 2
-FALLBACK_TEXT: str       = "I do not know"
-
-# reasoning を固定（フォールバックしない）
-STRICT_REASONING: bool   = True
-REASONING_EFFORT: str    = "high"            # ← ここを "low" / "medium" 等に変更可
-
-# タイムアウトは 60s → 240s（4倍）
-HTTP_TIMEOUT_SEC: float  = 240.0
-# ────────────────────────────────────── #
-
-# 1) .env（4項目だけでOK）
+# --- 認証・ネットワーク ---
+# .env は「OPENAI_API_KEY / AZURE_OPENAI_ENDPOINT / OPENAI_DEPLOYMENT_NAME（gpt-5 等）」のみでOK
 load_dotenv(override=True)
 api_key     = os.getenv("OPENAI_API_KEY")
 endpoint    = os.getenv("AZURE_OPENAI_ENDPOINT")  # 例: https://<resource>.cognitiveservices.azure.com
@@ -57,18 +78,28 @@ deployment  = os.getenv("OPENAI_DEPLOYMENT_NAME", "gpt-5")
 if not api_key or not endpoint:
     raise RuntimeError("❌ OPENAI_API_KEY / AZURE_OPENAI_ENDPOINT が未設定です。")
 
-# 2) プロキシ（未設定ならローカル既定）
+# プロキシ（未設定ならローカル既定）
 os.environ.setdefault("HTTP_PROXY",  os.getenv("HTTP_PROXY",  "http://localhost:3128"))
 os.environ.setdefault("HTTPS_PROXY", os.getenv("HTTPS_PROXY", "http://localhost:3128"))
 
-# 3) httpx クライアント（SSL検証オフ・タイムアウト 240s）
+# --- HTTP/2 自動フォールバック ---
+try:
+    import h2  # noqa: F401
+    _http2 = True
+except Exception:
+    _http2 = False
+    print("ℹ️ h2 未インストールのため HTTP/1.1 で接続します（http2=False）", file=sys.stderr)
+
+# httpx クライアント（SSL検証オフ・接続プール・HTTP/2は可能時のみ）
 http_client = httpx.Client(
-    verify=False,             # ← 開発用途のみ
+    verify=False,             # ← 開発用途のみ（本番は社内CA証明書を指定）
     timeout=HTTP_TIMEOUT_SEC,
     trust_env=True,
+    http2=_http2,
+    limits=httpx.Limits(max_connections=20, max_keepalive_connections=20),
 )
 
-# 4) Azure OpenAI クライアント（Responses API は /openai/v1/ & api-version=preview）
+# Azure OpenAI クライアント（Responses API は /openai/v1/ & api-version=preview）
 client = AzureOpenAI(
     api_key=api_key,
     base_url=f"{endpoint}/openai/v1/",
@@ -76,16 +107,111 @@ client = AzureOpenAI(
     http_client=http_client,
 )
 
-# ───────────────── 関数定義 ───────────────── #
+# ───────────────── 入力・画像探索 ───────────────── #
 
-def load_prompts(path: Path) -> List[str]:
-    if not path.exists():
-        raise FileNotFoundError(f"❌ Prompt file not found: {path}")
+def resolve_input_path(desk: Path) -> Path:
+    """入力ファイルの探索。/mnt/data/mrs3_prompts.csv を最優先。"""
+    mnt = Path("/mnt/data")
+    first = mnt / "mrs3_prompts.csv"
+    if first.exists():
+        return first
+    desktop_candidates = [desk / name for name in DEFAULT_CSVS]
+    mnt_candidates = [mnt / name for name in DEFAULT_CSVS if name != "mrs3_prompts.csv"]
+    for p in [*desktop_candidates, *mnt_candidates]:
+        if p.exists():
+            return p
+    raise FileNotFoundError("Prompt file not found in expected locations.")
+
+def resolve_images_dir(desk: Path) -> Path:
+    """画像ルート候補をデスクトップ優先で探索。無ければ /mnt/data 側も確認。"""
+    mnt = Path("/mnt/data")
+    for base in (desk, mnt):
+        for name in IMAGES_DIR_CANDIDATES:
+            p = base / name
+            if p.exists():
+                return p
+    raise FileNotFoundError("画像フォルダ（画像ファイル/画像データ）が見つかりません。")
+
+def load_rows(path: Path) -> pd.DataFrame:
+    """id, prompt, (任意)image_file を読む。A=ID, B=JPN などにも対応。"""
     df = pd.read_csv(path) if path.suffix.lower() == ".csv" else pd.read_excel(path)
-    series = df["prompt"] if "prompt" in df.columns else df.iloc[:, 0]
-    return series.astype(str).tolist()
+    cmap = {c.lower(): c for c in df.columns}
+
+    id_col = (cmap.get("id") or cmap.get("image_id") or cmap.get("id7")
+              or cmap.get("画像id") or cmap.get("患者id") or df.columns[0])
+    prompt_col = (cmap.get("prompt") or cmap.get("jpn") or cmap.get("日本語")
+                  or cmap.get("text") or (df.columns[1] if len(df.columns) > 1 else df.columns[0]))
+    img_col = cmap.get("image_file")  # 任意
+
+    use_cols = [id_col, prompt_col] + ([img_col] if img_col else [])
+    out = df[use_cols].copy()
+    out.columns = ["id", "prompt"] + (["image_file"] if img_col else [])
+
+    def to_id7(x):
+        digits = "".join(ch for ch in str(x).strip() if ch.isdigit())
+        return f"{int(digits):07d}"
+    out["id"] = out["id"].apply(to_id7)
+    return out
+
+def find_images_for_id(images_root: Path, id7: str) -> List[Path]:
+    """<root>/<id>/（優先）、無ければ <root>/ 直下から <id>*.png|.jpg|.jpeg を取得"""
+    patterns = (f"{id7}*.png", f"{id7}*.jpg", f"{id7}*.jpeg")
+    files: List[Path] = []
+    subdir = images_root / id7
+    if subdir.exists():
+        for pat in patterns:
+            files.extend(sorted(subdir.glob(pat)))
+    else:
+        for pat in patterns:
+            files.extend(sorted(images_root.glob(pat)))
+    return files
+
+def resolve_image_list(images_root: Path, id7: str, image_file_val: Optional[str]) -> List[Path]:
+    """image_file 指定があれば優先。見つからなければ <id>* 探索にフォールバック。"""
+    if image_file_val and str(image_file_val).strip():
+        names = [t.strip() for t in str(image_file_val).replace(";", ",").split(",") if t.strip()]
+        files: List[Path] = []
+        for name in names:
+            p = Path(name)
+            candidates = [p] if p.is_absolute() else [images_root / id7 / name, images_root / name]
+            for c in candidates:
+                if c.exists():
+                    files.append(c); break
+        if files:
+            return files
+    return find_images_for_id(images_root, id7)
+
+def to_data_url(p: Path) -> str:
+    mime, _ = mimetypes.guess_type(p.name)
+    if not mime:
+        mime = "image/jpeg"
+    b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+# ───────────────── Responses API 呼び出し ───────────────── #
+
+def build_user_content(prompt_text: str, image_paths: List[Path]) -> List[Dict]:
+    """
+    Responses API の input 用 content を構築（テキスト + 複数画像）。
+    - テキスト部は clinical/CT 併用の明示指示を含める
+    - 画像は Data URL 文字列で添付（※ image_url は dict ではなく str）
+    """
+    preface = (
+        "You must analyze the attached non-contrast head CT image(s) and explicitly state the image findings "
+        "(e.g., hemorrhage location, intraventricular extension, mass effect/midline shift, and approximate hematoma volume via ABC/2 when feasible). "
+        "In your reasoning and final answer, interleave findings from the CT image(s) with the Patient Data provided in the text, "
+        "clearly labeling which evidence comes from imaging vs. patient data."
+    )
+    content: List[Dict] = [
+        {"type": "input_text", "text": f"{preface}\n\n{prompt_text}"},
+    ]
+    for p in image_paths:
+        # ★ 修正点：image_url を {"url": ...} ではなく、Data URL の「文字列」で渡す
+        content.append({"type": "input_image", "image_url": to_data_url(p)})
+    return content
 
 def _extract_text_from_response(resp) -> str:
+    """Responses API の出力からテキストを抽出。output_text を優先、無ければ content 配列を走査。"""
     text = getattr(resp, "output_text", None)
     if text:
         return text.strip()
@@ -104,22 +230,24 @@ def _extract_text_from_response(resp) -> str:
         pass
     return ""
 
-def chat_once(prompt: str) -> (str, Optional[str]):
+def responses_once(user_content: List[Dict]) -> Tuple[str, Optional[str]]:
     """
-    Responses API に 1 回問い合わせて (応答文字列, エラーメッセージ) を返す。
-    reasoning は STRICT に固定。未対応でもフォールバックしない。
-    verbosity は常に low を送信。
+    Responses API に 1 回問い合わせて (応答文字列, エラー文字列) を返す。
+    - reasoning は STRICT に固定（非対応でもフォールバックしない）
+    - verbosity は常に low
     """
-    instructions = "Answer concisely. Do not include chain-of-thought."
+    system_instructions = (
+        "You are a stroke specialist. Always use both the Patient Data and any attached non-contrast head CT image(s). "
+        "Provide a concise, clinically useful final answer. Do NOT include chain-of-thought."
+    )
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             kwargs = dict(
                 model=deployment,
-                input=prompt,
-                instructions=instructions,
-                # ▼ 追加：verbosity を低冗長に固定
-                text={"verbosity": "low"},
+                instructions=system_instructions,
+                input=[{"role": "user", "content": user_content}],
+                text={"verbosity": "low"},  # 出力量を抑制
             )
             if STRICT_REASONING:
                 kwargs["reasoning"] = {"effort": REASONING_EFFORT}
@@ -139,45 +267,75 @@ def chat_once(prompt: str) -> (str, Optional[str]):
             time.sleep(backoff)
 
         except Exception as exc:
-            msg = str(exc)
-            return (FALLBACK_TEXT, f"unexpected error (reasoning='{REASONING_EFFORT}', verbosity='low'): {msg}")
+            return (FALLBACK_TEXT, f"unexpected error (reasoning='{REASONING_EFFORT}', verbosity='low'): {exc}")
 
-def save_results(results: List[Dict[str, str]], path: Path) -> None:
+# ───────────────── 保存 ───────────────── #
+
+def save_results(results: List[Dict[str, str]], xlsx_path: Path, csv_path: Path) -> None:
     if not results:
-        print("⚠️  保存対象が空のためスキップ", file=sys.stderr)
-        return
-    try:
-        with pd.ExcelWriter(path, engine="xlsxwriter") as w:
-            pd.DataFrame(results).to_excel(w, index=False, sheet_name="results")
-        print(f"✅ Results saved: {path}")
-    except Exception as exc:
-        print(f"❌ Failed to save results: {exc}", file=sys.stderr)
+        print("⚠️  保存対象が空のためスキップ", file=sys.stderr); return
+    df = pd.DataFrame(results)
+    with pd.ExcelWriter(xlsx_path, engine="xlsxwriter") as w:
+        df.to_excel(w, index=False, sheet_name="results")
+    print(f"✅ Results saved (xlsx): {xlsx_path}")
+    df.to_csv(csv_path, index=False, encoding="utf-8-sig", quoting=csv.QUOTE_ALL)
+    print(f"✅ Results saved (csv):  {csv_path}")
 
 # ─────────────────── メイン ─────────────────── #
 
 def main() -> None:
-    input_path  = DESKTOP_DIR / DEFAULT_INPUT_FILE
-    output_path = DESKTOP_DIR / OUTPUT_FILE_NAME
+    input_path  = resolve_input_path(DESKTOP_DIR)
+    output_xlsx = DESKTOP_DIR / OUTPUT_FILE_NAME
+    output_csv  = DESKTOP_DIR / OUTPUT_CSV_NAME
+    images_dir  = resolve_images_dir(DESKTOP_DIR)
 
     print(f"📥 Loading prompts from: {input_path}")
-    prompts = load_prompts(input_path)
-    print(f"✅ {len(prompts)} prompts loaded")
+    df = load_rows(input_path)
+    print(f"✅ {len(df)} rows loaded")
+    print(f"🖼  Using images root: {images_dir}")
 
     results: List[Dict[str, str]] = []
     try:
-        for i, p in enumerate(prompts, 1):
-            print(f"[{i}/{len(prompts)}] querying…")
-            ans, err = chat_once(p)
-            row = {
-                "prompt": p,
+        for i, r in enumerate(df.itertuples(index=False), 1):
+            id7: str = r.id
+            prompt_text: str = r.prompt
+            image_file_val: Optional[str] = getattr(r, "image_file", None) if hasattr(r, "image_file") else None
+
+            img_paths = resolve_image_list(images_dir, id7, image_file_val)
+
+            if not img_paths:
+                msg = f"⚠️  {id7}: 画像が見つかりません。REQUIRE_IMAGE=True のためスキップします。"
+                print(msg, file=sys.stderr)
+                results.append({
+                    "id": id7,
+                    "n_images": 0,
+                    "images": "",
+                    "prompt": prompt_text,
+                    "response": "SKIPPED (no images found)",
+                    "reasoning_effort": REASONING_EFFORT if STRICT_REASONING else "",
+                    "error": ""
+                })
+                if REQUIRE_IMAGE:
+                    continue  # 送信しない
+
+            user_content = build_user_content(prompt_text, img_paths)
+            print(f"[{i}/{len(df)}] querying… id={id7} images={len(img_paths)}")
+
+            ans, err = responses_once(user_content)
+
+            results.append({
+                "id": id7,
+                "n_images": len(img_paths),
+                "images": ";".join(p.name for p in img_paths),
+                "prompt": prompt_text,
                 "response": ans,
                 "reasoning_effort": REASONING_EFFORT if STRICT_REASONING else "",
-                "error": err or "",
-            }
-            results.append(row)
+                "error": err or ""
+            })
     finally:
-        print(f"💾 Saving → {output_path}")
-        save_results(results, output_path)
+        print(f"💾 Saving → {output_xlsx}, {output_csv}")
+        save_results(results, output_xlsx, output_csv)
+
     print("🎉 All done!")
 
 if __name__ == "__main__":
