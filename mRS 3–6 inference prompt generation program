@@ -1,17 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-generate_mrs3_prompts.py
-─────────────────────────────────────────────
-1. /mnt/data/Book1.xlsx
-2. /mnt/data/Book1 - Copy.xlsx
-3. <User Desktop>/Book1.xlsx
-4. <User Desktop>/Book1 - Copy.xlsx
-The script checks these paths in order and reads the first existing Excel file.
-
-Output:
-- If /mnt/data exists, output to /mnt/data/mrs3_prompts.csv
-- Otherwise, output to <Desktop>/mrs3_prompts.csv
+generate_mrs3_prompts.py (画像使用を必須化したテンプレ強化版)
+- 入力: 1) /mnt/data/Book1.xlsx  2) /mnt/data/Book1 - Copy.xlsx
+        3) <Desktop>/Book1.xlsx  4) <Desktop>/Book1 - Copy.xlsx
+- 出力: /mnt/data があれば /mnt/data/mrs3_prompts.csv
+        無ければ <Desktop>/mrs3_prompts.csv
+- 出力列: id(7桁), image_file(既定 <id>.png), prompt
 """
 
 import csv
@@ -19,9 +14,7 @@ from pathlib import Path
 from textwrap import dedent
 import pandas as pd
 
-# ------------------------------------------------------------
-# 1) Detect input/output paths
-# ------------------------------------------------------------
+# --- 入出力パス検出 ---
 desktop = Path.home() / "Desktop"
 if not desktop.exists():
     desktop = Path.home() / "デスクトップ"
@@ -32,7 +25,6 @@ candidates = [
     desktop / "Book1.xlsx",
     desktop / "Book1 - Copy.xlsx",
 ]
-
 for p in candidates:
     if p.exists():
         EXCEL_PATH = p
@@ -43,49 +35,72 @@ else:
 OUTPUT_CSV = Path("/mnt/data/mrs3_prompts.csv") if Path("/mnt/data").exists() \
              else desktop / "mrs3_prompts.csv"
 
-# ------------------------------------------------------------
-# 2) Prompt template in English
-# ------------------------------------------------------------
+# --- ID抽出ヘルパ ---
+ID_CANDIDATES = ["ID7", "ImageID", "image_id", "ID", "id"]
+
+def to_7digit_id(val, fallback_int=None) -> str:
+    if pd.notna(val):
+        s = str(val).strip()
+        digits = "".join(ch for ch in s if ch.isdigit())
+        if digits:
+            return f"{int(digits):07d}"
+    if fallback_int is None:
+        raise ValueError("Cannot determine 7-digit ID.")
+    return f"{int(fallback_int):07d}"
+
+def pick_row_id(row, idx) -> str:
+    for c in ID_CANDIDATES:
+        if c in row.index:
+            try:
+                return to_7digit_id(row[c], fallback_int=idx + 1)
+            except Exception:
+                pass
+    return to_7digit_id(None, fallback_int=idx + 1)
+
+# --- 強化テンプレート（画像の使用を必須化・mRS≥3 推定） ---
 TEMPLATE = dedent("""\
     ### ⬆ system ⬆
     You are a stroke specialist.
-    - You must not refer to any patient-specific information other than the "Patient Data" provided below.
-    - You may use general medical knowledge in your reasoning, but in the rationale section, cite only the patient data.
-    - Strictly follow the instructed output format and do not include unnecessary words.
+    - You may use general medical knowledge, but base your reasoning only on the Patient Data and the attached non-contrast head CT image(s).
+    - Strictly follow the instructed output format. Avoid unnecessary words.
+
+    ### ⬆ attachment ⬆
+    Non-contrast head CT image file(s) named "{image_file}" will be attached in a later step for integration.
 
     ### ⬆ user ⬆
-    Based on the following "Patient Data", estimate the **risk (0–100)** that a patient admitted with intracerebral hemorrhage (ICH) will have a **discharge modified Rankin Scale (mRS) score of 3 or greater**, and provide your rationale.
+    Using the **Patient Data below and the attached CT image(s)**, estimate the **risk (0–100)** that a patient admitted with intracerebral hemorrhage (ICH) will have a **discharge modified Rankin Scale (mRS) of 3 or greater**, and provide your rationale.
 
-    (`mrs3plus` = discharge modified Rankin Scale ≥3)
+    (Hereinafter, `mrs3plus` refers to discharge modified Rankin Scale ≥3.)
 
-    1. Provide a step-by-step reasoning process (maximum 1200 characters) in English.
-    2. Then output **〈Final JSON〉** containing only the following keys.
+    **Requirements**
+    1) Provide a **step-by-step reasoning (≤1200 characters)** in English that **interleaves**:
+       - key points from the **Patient Data**, and
+       - explicit **CT image findings** (e.g., hemorrhage location, intraventricular extension, mass effect/midline shift, approximate hematoma volume using ABC/2 if feasible).
+       Make it clear which parts come from the Patient Data and which come from the image(s).
+    2) Then output **〈Final JSON〉** containing only the keys below.
 
     {tabular}
 
     【JSON Keys】
     - "mrs3plus_prob"      : integer from 0 to 100
-    - "mrs3plus_rationale" : rationale citing patient data (English)
+    - "mrs3plus_rationale" : concise rationale that **explicitly cites both** patient data and image findings (English)
     """)
 
-# ------------------------------------------------------------
-# 3) Main process
-# ------------------------------------------------------------
+# --- メイン ---
 def main() -> None:
     print(f"[i] Using file: {EXCEL_PATH}")
     df = pd.read_excel(EXCEL_PATH, sheet_name=0)
 
     records = []
     for idx, row in df.iterrows():
+        id7 = pick_row_id(row, idx)
+        image_file = f"{id7}.png"  # 既定（実ファイルは実行側で <id>* を自動探索）
         patient_block = "\n".join(f"{col}: {row[col]}" for col in df.columns)
-        prompt_text = TEMPLATE.format(tabular=patient_block)
-        records.append({"id": idx + 1, "prompt": prompt_text})
+        prompt_text = TEMPLATE.format(tabular=patient_block, image_file=image_file)
+        records.append({"id": id7, "image_file": image_file, "prompt": prompt_text})
 
     pd.DataFrame(records).to_csv(
-        OUTPUT_CSV,
-        index=False,
-        encoding="utf-8-sig",
-        quoting=csv.QUOTE_ALL,
+        OUTPUT_CSV, index=False, encoding="utf-8-sig", quoting=csv.QUOTE_ALL
     )
     print(f"[✔] Output written to {OUTPUT_CSV}")
 
